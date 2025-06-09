@@ -1,62 +1,108 @@
-name: Build & publish wheels
+name: Build and Publish
 
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch:
+    tags:
+      - 'v*'  # Trigger on version tags like v1.0.0
+  pull_request:  # Test builds on PRs
+  workflow_dispatch:  # Allow manual triggers
 
 jobs:
-  build:
+  build_wheels:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14, windows-latest]   # macOS-14 = Apple Silicon runner
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-14]  # macos-14 is ARM64
+    
     steps:
       - uses: actions/checkout@v4
-
-      # 1. Install a stable Rust toolchain
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: pypa/cibuildwheel@v2.18
+      
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.16.5
         env:
+          # Skip some wheels to reduce build time (optional)
+          CIBW_SKIP: "cp36-* cp37-* cp38-* cp39-* cp310-* cp311-* cp312-* pp* *-musllinux_i686"
+          # Only build for Python 3.13 as specified in your pyproject.toml
           CIBW_BUILD: "cp313-*"
-          # Produce both x86_64 and aarch64 wheels on Linux; universal2 on macOS
+          # Ensure Rust is available during builds
+          CIBW_BEFORE_ALL_LINUX: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+          CIBW_ENVIRONMENT_LINUX: 'PATH="$HOME/.cargo/bin:$PATH"'
+          CIBW_BEFORE_ALL_MACOS: "rustup target add aarch64-apple-darwin x86_64-apple-darwin"
+          CIBW_BEFORE_ALL_WINDOWS: "rustup target add x86_64-pc-windows-msvc i686-pc-windows-msvc"
+          # Test the built wheels
+          CIBW_TEST_REQUIRES: "pytest"
+          CIBW_TEST_COMMAND: "pytest {project}/tests"
+          # Build both architectures on macOS
+          CIBW_ARCHS_MACOS: "x86_64 arm64"
+          # Build for both architectures on Linux
           CIBW_ARCHS_LINUX: "x86_64 aarch64"
-          CIBW_ARCHS_MACOS: "universal2"    # ^macos-14 gives arm64, macOS-13 gives x86_64
-          CIBW_SKIP: "*-musllinux_i686 *-pypy*"  # skip musl & PyPy if you like
-
-      # 3. Upload the wheels as a build artefact so the publish job can grab them
+          # For aarch64 Linux, use QEMU
+          CIBW_BEFORE_BUILD_LINUX: |
+            if [[ "$CIBW_ARCHS" == *"aarch64"* ]]; then
+              docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+            fi
+      
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
-          path: wheelhouse/*
+          name: wheels-${{ matrix.os }}-${{ strategy.job-index }}
+          path: ./wheelhouse/*.whl
 
-  sdist:
-    name: Source sdist
-    runs-on: ubuntu-22.04
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: pip install maturin~=1.8
-      - run: maturin sdist -o dist
+      
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      
+      - name: Build sdist
+        run: pipx run build --sdist
+      
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
-          path: dist/*
+          name: sdist
+          path: dist/*.tar.gz
 
   publish:
-    needs: [build, sdist]
-    runs-on: ubuntu-22.04
-    permissions:
-      id-token: write          # → PyPI’s “trusted publisher” flow
+    name: Publish to PyPI
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    # Only publish on tagged releases
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
-          path: final_dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          # Download all artifacts to dist/
+          path: dist
+          merge-multiple: true
+      
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: final_dist
-          verbose: true
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          # Uncomment to use TestPyPI first
+          # repository-url: https://test.pypi.org/legacy/
+
+  # Optional: Create GitHub Release
+  release:
+    name: Create GitHub Release
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*
+          generate_release_notes: true
