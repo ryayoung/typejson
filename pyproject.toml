@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "typejson"
-version = "1.0.2"
+version = "1.0.3"
 requires-python = ">=3.13"
 description = "JSON static type checking and runtime type narrowing."
 authors = [
